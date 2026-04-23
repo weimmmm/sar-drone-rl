@@ -1,5 +1,5 @@
 # Copyright (c) 2026 Alex Jauregui & Erik Eguskiza.
-# Stage 2 v5: Obstacles + Waypoints with Directional Observations - FINETUNING VERSION
+# Stage 2 v5: Obstacles + Waypoints with Directional Observations
 
 from __future__ import annotations
 
@@ -99,9 +99,8 @@ class QuadcopterObstaclesEnvCfg(DirectRLEnvCfg):
     distance_to_waypoint_reward_scale = 10.0
     waypoint_reached_bonus = 50.0
     all_waypoints_bonus = 200.0
-    obstacle_proximity_reward_scale = -10.0  # Penalización posicional
-    collision_risk_reward_scale = -15.0      # NUEVO: Penalización por vector velocidad
-    progress_reward_scale = 5.0
+    obstacle_proximity_reward_scale = -10.0  # Más penalización
+    progress_reward_scale = 5.0  # Reward por avanzar hacia waypoint
 
 
 class QuadcopterObstaclesEnv(DirectRLEnv):
@@ -130,7 +129,7 @@ class QuadcopterObstaclesEnv(DirectRLEnv):
         # Previous distance to waypoint (for progress reward)
         self._prev_dist_to_waypoint = torch.zeros(self.num_envs, device=self.device)
         
-        # Obstacles: (num_envs, num_obstacles, 3)
+        # Obstacles: (num_envs, num_obstacles, 3) - ahora con altura
         self._obstacle_positions_local = torch.zeros(
             self.num_envs, self.cfg.num_obstacles, 3, device=self.device
         )
@@ -140,7 +139,7 @@ class QuadcopterObstaclesEnv(DirectRLEnv):
         self._randomize_obstacles(all_env_ids)
         self._randomize_waypoints(all_env_ids)
 
-        # Logging - AÑADIDO collision_risk
+        # Logging
         self._episode_sums = {
             key: torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
             for key in [
@@ -149,7 +148,6 @@ class QuadcopterObstaclesEnv(DirectRLEnv):
                 "distance_to_waypoint",
                 "waypoint_bonus",
                 "obstacle_proximity",
-                "collision_risk",
                 "progress",
             ]
         }
@@ -160,13 +158,14 @@ class QuadcopterObstaclesEnv(DirectRLEnv):
         self._gravity_magnitude = torch.tensor(self.sim.cfg.gravity, device=self.device).norm()
         self._robot_weight = (self._robot_mass * self._gravity_magnitude).item()
 
-        # Ajuste Físico: Umbral casi cero para colisión real
-        self._collision_threshold = 0.02 
+        self._collision_threshold = 0.05
 
         self.set_debug_vis(self.cfg.debug_vis)
 
-        print(f"[INFO] Quadcopter Obstacles v5 - FineTuning Ready")
-        print(f"[INFO] Obstacles: {self.cfg.num_obstacles}")
+        print(f"[INFO] Quadcopter Obstacles v5 - Directional Observations")
+        print(f"[INFO] Obstacles: {self.cfg.num_obstacles} (observing {self.cfg.num_closest_obstacles} closest)")
+        print(f"[INFO] Waypoints: {self.cfg.num_waypoints}")
+        print(f"[INFO] Observation space: {self.cfg.observation_space}")
 
     def _setup_scene(self):
         self._robot = Articulation(self.cfg.robot)
@@ -185,6 +184,7 @@ class QuadcopterObstaclesEnv(DirectRLEnv):
         light_cfg.func("/World/Light", light_cfg)
 
     def _randomize_obstacles(self, env_ids: torch.Tensor):
+        """Generate random obstacle positions."""
         num_envs_to_reset = len(env_ids)
         
         angles = torch.zeros(num_envs_to_reset, self.cfg.num_obstacles, device=self.device)
@@ -200,13 +200,14 @@ class QuadcopterObstaclesEnv(DirectRLEnv):
         
         x = radii * torch.cos(angles)
         y = radii * torch.sin(angles)
-        z = torch.ones_like(x) * (self.cfg.obstacle_height / 2)
+        z = torch.ones_like(x) * (self.cfg.obstacle_height / 2)  # Centro del obstáculo
         
         self._obstacle_positions_local[env_ids, :, 0] = x
         self._obstacle_positions_local[env_ids, :, 1] = y
         self._obstacle_positions_local[env_ids, :, 2] = z
 
     def _randomize_waypoints(self, env_ids: torch.Tensor):
+        """Generate random waypoint positions."""
         num_envs_to_reset = len(env_ids)
         
         for i in range(self.cfg.num_waypoints):
@@ -232,9 +233,10 @@ class QuadcopterObstaclesEnv(DirectRLEnv):
         self._current_waypoint_idx[env_ids] = 0
         self._waypoints_completed[env_ids] = 0
         self._all_waypoints_done[env_ids] = False
-        self._prev_dist_to_waypoint[env_ids] = 10.0
+        self._prev_dist_to_waypoint[env_ids] = 10.0  # Initial large distance
 
     def _get_current_waypoint_world(self) -> torch.Tensor:
+        """Get current waypoint in world coordinates."""
         batch_indices = torch.arange(self.num_envs, device=self.device)
         current_wp_local = self._waypoint_positions_local[batch_indices, self._current_waypoint_idx]
         
@@ -244,39 +246,58 @@ class QuadcopterObstaclesEnv(DirectRLEnv):
         return current_wp_world
 
     def _compute_closest_obstacles_directional(self) -> tuple[torch.Tensor, torch.Tensor]:
-        """Compute direction and distance to N closest obstacles in BODY FRAME."""
-        drone_pos_w = self._robot.data.root_pos_w
-        drone_quat_w = self._robot.data.root_quat_w
-        env_origins = self._terrain.env_origins
+        """
+        Compute direction and distance to N closest obstacles in BODY FRAME.
+        Returns:
+            directions: (num_envs, num_closest, 3) - unit vectors in body frame
+            distances: (num_envs, num_closest) - normalized distances
+        """
+        # Drone position in world
+        drone_pos_w = self._robot.data.root_pos_w  # (num_envs, 3)
+        drone_quat_w = self._robot.data.root_quat_w  # (num_envs, 4)
+        env_origins = self._terrain.env_origins  # (num_envs, 3)
         
-        drone_pos_local = drone_pos_w - env_origins
+        # Drone position local
+        drone_pos_local = drone_pos_w - env_origins  # (num_envs, 3)
         
-        drone_expanded = drone_pos_local.unsqueeze(1)
-        to_obstacles = self._obstacle_positions_local - drone_expanded
+        # Vector from drone to each obstacle (in local/world frame)
+        # drone_pos_local: (num_envs, 3) -> (num_envs, 1, 3)
+        # obstacles: (num_envs, num_obstacles, 3)
+        drone_expanded = drone_pos_local.unsqueeze(1)  # (num_envs, 1, 3)
+        to_obstacles = self._obstacle_positions_local - drone_expanded  # (num_envs, num_obstacles, 3)
         
-        distances = torch.linalg.norm(to_obstacles, dim=2)
-        distances = distances - self.cfg.obstacle_radius
+        # Distances (3D)
+        distances = torch.linalg.norm(to_obstacles, dim=2)  # (num_envs, num_obstacles)
+        distances = distances - self.cfg.obstacle_radius  # Surface distance
         
+        # Get indices of N closest obstacles
         _, closest_indices = torch.topk(distances, self.cfg.num_closest_obstacles, dim=1, largest=False)
+        # closest_indices: (num_envs, num_closest)
         
+        # Gather closest obstacle vectors
         batch_indices = torch.arange(self.num_envs, device=self.device).unsqueeze(1).expand(-1, self.cfg.num_closest_obstacles)
-        closest_vectors = to_obstacles[batch_indices, closest_indices]
-        closest_distances = distances[batch_indices, closest_indices]
+        closest_vectors = to_obstacles[batch_indices, closest_indices]  # (num_envs, num_closest, 3)
+        closest_distances = distances[batch_indices, closest_indices]  # (num_envs, num_closest)
         
+        # Convert directions to body frame
+        # Normalize vectors first
         closest_vectors_norm = closest_vectors / (torch.linalg.norm(closest_vectors, dim=2, keepdim=True) + 1e-6)
         
+        # Rotate to body frame using quat_rotate_inverse
+        # Need to reshape for the function
         num_closest = self.cfg.num_closest_obstacles
         closest_vectors_flat = closest_vectors_norm.reshape(self.num_envs * num_closest, 3)
         drone_quat_expanded = drone_quat_w.unsqueeze(1).expand(-1, num_closest, -1).reshape(self.num_envs * num_closest, 4)
         
         directions_body = quat_apply_inverse(drone_quat_expanded, closest_vectors_flat)
-        directions_body = directions_body.reshape(self.num_envs, num_closest, 3)
         
+        # Normalize distances
         distances_normalized = (closest_distances / self.cfg.obstacle_detection_range).clamp(0.0, 1.0)
         
         return directions_body, distances_normalized
 
     def _compute_min_obstacle_distance(self) -> torch.Tensor:
+        """Compute minimum distance to any obstacle (for collision/reward)."""
         drone_pos_w = self._robot.data.root_pos_w[:, :2]
         env_origins_xy = self._terrain.env_origins[:, :2]
         drone_pos_local = drone_pos_w - env_origins_xy
@@ -298,96 +319,96 @@ class QuadcopterObstaclesEnv(DirectRLEnv):
         self._robot.set_external_force_and_torque(self._thrust, self._moment, body_ids=self._body_id)
 
     def _get_observations(self) -> dict:
+        """Compute observations with directional obstacle info."""
+        # Current waypoint in body frame
         current_wp_world = self._get_current_waypoint_world()
         waypoint_pos_b, _ = subtract_frame_transforms(
             self._robot.data.root_pos_w, self._robot.data.root_quat_w, current_wp_world
         )
         
+        # Waypoint progress
         progress = self._waypoints_completed.float() / self.cfg.num_waypoints
         
+        # Closest obstacles (directional)
         obstacle_directions, obstacle_distances = self._compute_closest_obstacles_directional()
-        obstacle_dirs_flat = obstacle_directions.reshape(self.num_envs, -1)
+        # obstacle_directions: (num_envs, 5, 3)
+        # obstacle_distances: (num_envs, 5)
         
+        # Flatten obstacle info
+        obstacle_dirs_flat = obstacle_directions.reshape(self.num_envs, -1)  # (num_envs, 15)
+        
+        # Build observation
         obs = torch.cat(
             [
-                self._robot.data.root_lin_vel_b,
-                self._robot.data.root_ang_vel_b,
-                self._robot.data.projected_gravity_b,
-                waypoint_pos_b,
-                obstacle_dirs_flat,
-                obstacle_distances,
-                progress.unsqueeze(1),
+                self._robot.data.root_lin_vel_b,      # 3
+                self._robot.data.root_ang_vel_b,      # 3
+                self._robot.data.projected_gravity_b, # 3
+                waypoint_pos_b,                        # 3
+                obstacle_dirs_flat,                    # 15 (5 obstacles * 3 dims)
+                obstacle_distances,                    # 5
+                progress.unsqueeze(1),                 # 1
             ],
             dim=-1,
-        )
+        )  # Total: 33
         
+        # Padding (98 - 33 = 65)
         padding = torch.zeros(self.num_envs, 65, device=self.device)
         obs = torch.cat([obs, padding], dim=-1)
         
         return {"policy": obs}
 
     def _get_rewards(self) -> torch.Tensor:
-        # 1. Base states
+        """Compute rewards."""
+        # Velocity penalties
         lin_vel = torch.sum(torch.square(self._robot.data.root_lin_vel_b), dim=1)
         ang_vel = torch.sum(torch.square(self._robot.data.root_ang_vel_b), dim=1)
         
-        # 2. Waypoint Rewards
+        # Distance to current waypoint
         current_wp_world = self._get_current_waypoint_world()
         distance_to_waypoint = torch.linalg.norm(current_wp_world - self._robot.data.root_pos_w, dim=1)
         distance_reward = 1 - torch.tanh(distance_to_waypoint / 2.0)
         
+        # Progress reward (getting closer to waypoint)
         progress_reward = (self._prev_dist_to_waypoint - distance_to_waypoint).clamp(-1.0, 1.0)
         self._prev_dist_to_waypoint = distance_to_waypoint.clone()
         
+        # Waypoint reached check
         waypoint_reached = (distance_to_waypoint < self.cfg.waypoint_reach_threshold) & (~self._all_waypoints_done)
+        
         waypoint_bonus = torch.zeros(self.num_envs, device=self.device)
         
         if waypoint_reached.any():
             waypoint_bonus[waypoint_reached] = self.cfg.waypoint_reached_bonus
+            
             self._current_waypoint_idx[waypoint_reached] += 1
             self._waypoints_completed[waypoint_reached] += 1
+            
+            # Reset prev distance for new waypoint
             self._prev_dist_to_waypoint[waypoint_reached] = 10.0
             
             all_done_now = self._current_waypoint_idx >= self.cfg.num_waypoints
             first_time_all_done = all_done_now & (~self._all_waypoints_done)
+            
             waypoint_bonus[first_time_all_done] += self.cfg.all_waypoints_bonus
             
             self._all_waypoints_done = self._all_waypoints_done | all_done_now
             self._current_waypoint_idx = self._current_waypoint_idx.clamp(0, self.cfg.num_waypoints - 1)
         
-        # 3. Obstacle Rewards & Risks
+        # Obstacle proximity penalty
         min_obstacle_dist = self._compute_min_obstacle_distance()
         
-        # A. Proximidad posicional (más agresiva: * 4.0)
         obstacle_proximity = torch.where(
             min_obstacle_dist < 1.0,
-            torch.exp(-min_obstacle_dist * 4.0),
+            torch.exp(-min_obstacle_dist * 3.0),  # Más agresivo
             torch.zeros_like(min_obstacle_dist)
         )
-
-        # B. Riesgo de Colisión (Vector Velocidad)
-        obs_dirs_body, obs_dists_norm = self._compute_closest_obstacles_directional()
-        vel_body = self._robot.data.root_lin_vel_b.unsqueeze(1) # (N, 1, 3)
         
-        # Dot product: Velocidad proyectada hacia cada obstáculo
-        vel_towards_obs = torch.sum(vel_body * obs_dirs_body, dim=2) # (N, 5)
-        
-        # Mask: Penalizar si vamos rápido hacia el obstáculo (>0.1) Y estamos cerca (dist norm < 0.5)
-        risk_mask = (vel_towards_obs > 0.1) & (obs_dists_norm < 0.5)
-        
-        # Magnitud del riesgo: (Velocidad * (1 - Distancia))
-        # Cuanto más rápido y más cerca, mayor el valor.
-        risk_magnitude = vel_towards_obs * (1.0 - obs_dists_norm)
-        collision_risk = torch.sum(risk_magnitude * risk_mask.float(), dim=1)
-        
-        # 4. Total Reward
         rewards = {
             "lin_vel": lin_vel * self.cfg.lin_vel_reward_scale * self.step_dt,
             "ang_vel": ang_vel * self.cfg.ang_vel_reward_scale * self.step_dt,
             "distance_to_waypoint": distance_reward * self.cfg.distance_to_waypoint_reward_scale * self.step_dt,
             "waypoint_bonus": waypoint_bonus,
             "obstacle_proximity": obstacle_proximity * self.cfg.obstacle_proximity_reward_scale * self.step_dt,
-            "collision_risk": collision_risk * self.cfg.collision_risk_reward_scale * self.step_dt,
             "progress": progress_reward * self.cfg.progress_reward_scale * self.step_dt,
         }
         
@@ -399,13 +420,13 @@ class QuadcopterObstaclesEnv(DirectRLEnv):
         return reward
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Check termination."""
         time_out = self.episode_length_buf >= self.max_episode_length - 1
         
         too_low = self._robot.data.root_pos_w[:, 2] < 0.1
         too_high = self._robot.data.root_pos_w[:, 2] > 2.5
         
         min_obstacle_dist = self._compute_min_obstacle_distance()
-        # Colisión estricta (si tocas, mueres)
         collision = min_obstacle_dist < self._collision_threshold
         
         success = self._all_waypoints_done
@@ -422,9 +443,11 @@ class QuadcopterObstaclesEnv(DirectRLEnv):
         return terminated, time_out
 
     def _reset_idx(self, env_ids: torch.Tensor | None):
+        """Reset environments."""
         if env_ids is None or len(env_ids) == self.num_envs:
             env_ids = self._robot._ALL_INDICES
 
+        # Logging
         avg_waypoints = self._waypoints_completed[env_ids].float().mean().item()
         success_rate = self._all_waypoints_done[env_ids].float().mean().item()
         
